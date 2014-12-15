@@ -1,0 +1,9 @@
+#!/bin/sh
+
+# This script accepts arguments on the command line. They are:
+# $1 the old link status (True or False)
+# $2 the new link status
+# $3 the old list of active interfaces 
+# $4 the new list of active interfaces
+# $5 the old ap mode status (True or False)
+# $6 the new ap mode status
