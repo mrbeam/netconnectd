@@ -6,6 +6,7 @@ import logging
 import netaddr
 import re
 import subprocess
+import sys
 import time
 import threading
 import wifi
@@ -38,6 +39,9 @@ class Server(object):
                  path_interfaces="/etc/network/interfaces"):
 
         self.logger = logging.getLogger(__name__)
+        def exception_logger(exc_type, exc_value, exc_tb):
+            self.logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+        sys.excepthook = exception_logger
 
         self.Hostapd = wifi.Hostapd.for_hostapd_and_confd(path_hostapd, path_hostapd_conf)
         self.Dnsmasq = wifi.Dnsmasq.for_dnsmasq_and_confd(path_dnsmasq, path_dnsmasq_conf)
@@ -62,6 +66,7 @@ class Server(object):
         self.server_address = server_address
 
         # prepare access point configuration
+        self.logger.debug("Creating access point object and resetting configuration")
         self.access_point = self.AccessPoint.for_arguments(self.wifi_if, self.ap_name,
                                                            ap_ssid, ap_channel, ap_ip, ap_network,
                                                            ap_range[0], ap_range[1], forwarding_to=wired_if if ap_forwarding else None,
@@ -69,6 +74,7 @@ class Server(object):
                                                            dnsmasq_options=dict(domain=ap_domain))
         self.access_point.save(allow_overwrite=True)
         if self.access_point.is_running():
+            self.logger.debug("Access point was running while starting up, disabling it")
             self.access_point.deactivate()
 
         # prepare wifi configuration
@@ -93,15 +99,25 @@ class Server(object):
         # we start out with a fully maxed link down count so that we will directly try to create a connection
         self.link_down_count = linkmon_maxdown
 
+        # we need to make sure that client messages and link events are never handled concurrently, so we synchronize via
+        # this mutex
+        self.mutex = threading.RLock()
+
 
     def _link_monitor(self, interval=10, callback=None):
         former_link, reachable_devs = has_link()
 
+        self.logger.info("Starting up link monitor with interval %ds" % interval)
+
         while True:
-            current_link, reachable_devs = has_link()
-            callback(former_link, current_link, reachable_devs)
-            time.sleep(interval)
-            former_link = current_link
+            try:
+                with self.mutex:
+                    current_link, reachable_devs = has_link()
+                    callback(former_link, current_link, reachable_devs)
+                time.sleep(interval)
+                former_link = current_link
+            except:
+                self.logger.exception("Something went wrong inside the link monitor")
 
     def _socket_monitor(self, server_address, callbacks=None):
         if not callbacks:
@@ -115,7 +131,7 @@ class Server(object):
             if os.path.exists(server_address):
                 raise
 
-        self.logger.info('Starting up on %s...' % server_address)
+        self.logger.info('Starting up socket monitor on %s...' % server_address)
 
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.bind(server_address)
@@ -124,45 +140,48 @@ class Server(object):
         sock.listen(1)
 
         while True:
-            self.logger.info('Waiting for connection...')
+            self.logger.info('Waiting for connection on socket...')
             connection, client_address = sock.accept()
 
-            try:
-                buffer = []
-                while True:
-                    chunk = connection.recv(16)
-                    if chunk:
-                        self.logger.info('Recv: %r' % chunk)
-                        buffer.append(chunk)
-                        if chunk.endswith('\x00'):
-                            break
-
-                data = ''.join(buffer).strip()[:-1]
-
-                ret = False
-                result = 'unknown message'
-
-                message = Message.from_str(data)
-                if message and callbacks and message.cmd in callbacks and callbacks[message.cmd]:
-                    ret, result = callbacks[message.cmd](message)
-
-                if ret:
-                    response = SuccessResponse(result)
-                else:
-                    response = ErrorResponse(result)
-
-                self.logger.info('Send: %s' % str(response))
-                connection.sendall(str(response) + '\x00')
-
-            except:
-                self.logger.exception('Got an error while processing message from client, aborting')
-
+            with self.mutex:
                 try:
-                    connection.sendall(str(ErrorResponse("error while processing message from client")) + '\x00')
+                    buffer = []
+                    while True:
+                        chunk = connection.recv(16)
+                        if chunk:
+                            self.logger.info('Recv: %r' % chunk)
+                            buffer.append(chunk)
+                            if chunk.endswith('\x00'):
+                                break
+
+                    data = ''.join(buffer).strip()[:-1]
+
+                    ret = False
+                    result = 'unknown message'
+
+                    message = Message.from_str(data)
+                    if message and callbacks and message.cmd in callbacks and callbacks[message.cmd]:
+                        ret, result = callbacks[message.cmd](message)
+
+                    if ret:
+                        response = SuccessResponse(result)
+                    else:
+                        response = ErrorResponse(result)
+
+                    self.logger.info('Send: %s' % str(response))
+                    connection.sendall(str(response) + '\x00')
+
                 except:
-                    pass
+                    self.logger.exception('Got an error while processing message from client, aborting')
+
+                    try:
+                        connection.sendall(str(ErrorResponse("error while processing message from client")) + '\x00')
+                    except:
+                        pass
 
     def start(self):
+        self.logger.info("### Starting up netconnectd server...")
+
         if self.linkmon_enabled:
             self.link_thread.start()
 
@@ -184,28 +203,54 @@ class Server(object):
             subprocess.check_call(['rfkill', 'unblock', 'wlan'])
 
     def start_ap(self):
+        self.logger.info("Starting up access point")
+        if self.access_point.is_running():
+            self.logger.debug("Access point is already running, stopping it first...")
+            self.stop_ap()
+            self.logger.debug("... stopped, now continuing with restarting it")
+
         # do a last scan before we bring up the ap
-        self.wifi_scan()
+        self.logger.debug("Scanning for available networks")
+        try:
+            self.wifi_scan()
+        except:
+            # oops, that apparently ran into trouble!
+            self.logger.exception("Got an error while trying to scan for available networks before bringing up AP")
 
         # bring up the ap
+        self.logger.debug("Freeing wifi interface")
         self.free_wifi()
+        self.logger.debug("Starting up AP")
         self.access_point.activate()
-        self.logger.info("Started up AP")
 
         # make sure multicast addresses can be routed on the AP
-        subprocess.check_call(['/sbin/ip', 'route', 'add', '224.0.0.0/4', 'dev', self.wifi_if])
-        subprocess.check_call(['/sbin/ip', 'route', 'add', '239.255.255.250', 'dev', self.wifi_if])
+        self.logger.debug("Adding multicast routes")
+        try:
+            subprocess.check_call(['/sbin/ip', 'route', 'add', '224.0.0.0/4', 'dev', self.wifi_if])
+            subprocess.check_call(['/sbin/ip', 'route', 'add', '239.255.255.250', 'dev', self.wifi_if])
+            self.logger.debug("Added multicast routes")
+        except subprocess.CalledProcessError as e:
+            self.logger.exception("Could not add multicast routes")
+            self.logger.warn("Output: " % e.output)
+            return False
 
         return True
 
     def stop_ap(self):
         # make sure multicast addresses can be routed on the AP
-        subprocess.check_call(['/sbin/ip', 'route', 'del', '224.0.0.0/4', 'dev', self.wifi_if])
-        subprocess.check_call(['/sbin/ip', 'route', 'del', '239.255.255.250', 'dev', self.wifi_if])
+        self.logger.debug("Removing multicast routes")
+        try:
+            subprocess.check_output(['/sbin/ip', 'route', 'del', '224.0.0.0/4', 'dev', self.wifi_if])
+            subprocess.check_output(['/sbin/ip', 'route', 'del', '239.255.255.250', 'dev', self.wifi_if])
+        except subprocess.CalledProcessError as e:
+            self.logger.exception("Could not remove multicast routes")
+            self.logger.warn("Output: %s" % e.output)
 
+        self.logger.debug("Freeing wifi interface")
         self.free_wifi()
+        self.logger.debug("Stopping AP")
         self.access_point.deactivate()
-        self.logger.info("Stopped AP")
+        self.logger.debug("Stopped AP")
 
         return True
 
@@ -213,11 +258,15 @@ class Server(object):
         if self.access_point.is_running():
             raise RuntimeError("Can't scan for wifi cells when in ap mode")
 
+        self.logger.debug("Freeing wifi interface")
         self.free_wifi()
+        self.logger.debug("Starting interface %s" % self.wifi_if)
         subprocess.check_call(['ifconfig', self.wifi_if, 'up'])
 
+        self.logger.debug("Scanning for cells")
         self.cells = wifi.Cell.all(self.wifi_if)
 
+        self.logger.debug("Converting result of scan")
         return self.__class__.convert_cells(self.cells)
 
     def find_cell(self, ssid, force=False):
@@ -225,6 +274,7 @@ class Server(object):
             if not force:
                 return None
 
+            self.logger.debug("No cached copy of wifi networks available, have to scan")
             if self.access_point.is_running():
                 # ap activation includes explicit call to wifi_scan
                 self.stop_ap()
@@ -232,18 +282,21 @@ class Server(object):
             else:
                 self.wifi_scan()
 
+        if not self.cells:
+            return None
+
         try:
             return list(filter(lambda x: x.ssid == ssid, self.cells))[0]
         except IndexError:
             return None
 
-    def start_wifi(self):
+    def start_wifi(self, enable_restart=True):
         self.logger.debug("Connecting to wifi %s..." % self.wifi_connection_ssid)
-
         restart_ap = False
-        if self.access_point.is_running():
+        if self.access_point.is_running() and enable_restart:
+            self.logger.info("Access Point is currently running, will restore if wifi starting fails!")
             restart_ap = True
-            self.access_point.deactivate()
+            self.stop_ap()
 
         self.free_wifi()
 
@@ -259,11 +312,11 @@ class Server(object):
             self.logger.warn("Could not connect to wifi %s" % self.wifi_connection_ssid)
             try:
                 self.wifi_connection.deactivate()
-
-                if restart_ap:
-                    self.access_point.activate()
             except:
-                self.logger.warn("Could not deactivate wifi connection again, that's odd")
+                self.logger.exception("Could not deactivate wifi connection again, that's odd")
+
+            if restart_ap:
+                self.start_ap()
             return False
 
     def forget_wifi(self):
@@ -273,11 +326,19 @@ class Server(object):
             self.logger.debug("No wifi configured to forget")
             return True
 
+        self.logger.debug("Freeing wifi interface")
         self.free_wifi()
+
+        self.logger.debug("Deactivating wifi connection")
         self.wifi_connection.deactivate()
+
+        self.logger.debug("Deleting wifi connection")
         self.wifi_connection.delete()
         self.wifi_connection = None
         self.wifi_available = False
+
+        self.logger.debug("Forgot wifi")
+
         return True
 
     def on_start_ap_message(self, message):
@@ -333,12 +394,12 @@ class Server(object):
         if self.wifi_connection:
             self.wifi_connection.delete()
 
-        self.wifi_connection = self.Scheme.for_cell(self.wifi_if, self.wifi_name, cell, passkey=message.psk)
+        self.wifi_connection = self.Scheme.for_cell(self.wifi_if, self.wifi_name, cell, passkey=message.psk if message.psk is not None else "")
         self.wifi_connection.save(allow_overwrite=True)
 
         self.wifi_available = True
         self.logger.info("Saved configuration for wifi %s" % message.ssid)
-        return True, 'configured wifi as "witbox_wifi"'
+        return True, 'configured wifi as "%s"' % self.wifi_name
 
     def on_select_wifi_message(self, message):
         if self.wifi_connection is None:
@@ -405,7 +466,7 @@ class Server(object):
 
         if self.wifi_connection is not None:
             self.logger.info("Link down, got a configured wifi connection, trying that")
-            if self.start_wifi():
+            if self.start_wifi(enable_restart=False):
                 return
 
         self.logger.info("Link still down, starting access point")
