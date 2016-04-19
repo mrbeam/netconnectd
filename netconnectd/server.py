@@ -121,7 +121,7 @@ class Server(object):
         self.link_thread.daemon = True
 
         # we start out with a fully maxed link down count so that we will directly try to create a connection
-        self.link_down_count = linkmon_maxdown
+        self.link_down_count = 0
 
         # we need to make sure that client messages and link events are never handled concurrently, so we synchronize via
         # this mutex
