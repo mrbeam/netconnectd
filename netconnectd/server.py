@@ -32,9 +32,9 @@ class Server(object):
         return result
 
     def __init__(self, server_address=None, wifi_if=None, wired_if=None, linkmon_enabled=True, linkmon_maxdown=3, linkmon_interval=10,
-                 ap_driver="nl80211", ap_ssid=None, ap_psk=None, ap_name='netconnectd_ap', ap_channel=2, ap_ip='10.250.250.1',
+                 ap_driver="nl80211", ap_ssid=None, ap_psk=None, ap_name='netconnectd_ap', ap_channel=3, ap_ip='10.250.250.1',
                  ap_network='10.250.250.0/24', ap_range=('10.250.250.100', '10.250.250.200'), ap_forwarding=False,
-                 ap_domain=None, wifi_name='netconnect_wifi', wifi_free=False, path_hostapd="/usr/sbin/hostapd",
+                 ap_domain=None, wifi_name='netconnect_wifi', wifi_free=False, wifi_kill=False, path_hostapd="/usr/sbin/hostapd",
                  path_hostapd_conf="/etc/hostapd/conf.d", path_dnsmasq="/usr/sbin/dnsmasq", path_dnsmasq_conf="/etc/dnsmasq.conf.d",
                  path_interfaces="/etc/network/interfaces"):
 
@@ -55,7 +55,31 @@ class Server(object):
         self.ap_name = ap_name
         self.wifi_if = wifi_if
         self.wifi_name = wifi_name
+
+        self.wifi_if_present = True
+        try:
+            subprocess.check_call(['ifconfig', self.wifi_if])
+        except subprocess.CalledProcessError as e:
+            self.logger.warn("Error while trying to retrieve status of {wifi_if}: {output}".format(wifi_if=self.wifi_if, output=e.output))
+            self.wifi_if_present = False
+
+        # Make sure it's safe to run nmcli
+        if wifi_free:
+            try:
+                subprocess.check_call(['nmcli', 'nm', 'status'])
+            except OSError as e:
+                self.logger.warn("Couldn't run nmcli (%s): %s", e.filename,
+                                 e.message)
+                self.logger.warn("Disabling NetworkManager compatibility.")
+                wifi_free = False
+            except subprocess.CalledProcessError as e:
+                self.logger.warn("Error during test run of nmcli: %s", e.message)
+                self.logger.warn("Disabling NetworkManager compatibility.")
+                wifi_free = False
+
         self.wifi_free = wifi_free
+
+        self.wifi_kill = wifi_kill
 
         self.wired_if = wired_if
 
@@ -202,7 +226,23 @@ class Server(object):
             subprocess.check_call(['nmcli', 'nm', 'wifi', 'off'])
             subprocess.check_call(['rfkill', 'unblock', 'wlan'])
 
+    def reset_wifi(self):
+        if self.wifi_kill:
+            import time
+            try:
+                output = subprocess.check_output(['rfkill', 'block', 'wlan'])
+                self.logger.debug("Blocked wifi, sleeping now for 2s: " + output)
+                time.sleep(2)
+                output = subprocess.check_output(['rfkill', 'unblock', 'wlan'])
+                self.logger.debug("Unblocked wifi again: " + output)
+            except:
+                self.logger.exception("Something went wrong while trying to reset the wifi interface")
+
     def start_ap(self):
+        if not self.wifi_if_present:
+            self.logger.warn("Wifi interface is not present, can't act as AP")
+            return False
+
         self.logger.info("Starting up access point")
         if self.access_point.is_running():
             self.logger.debug("Access point is already running, stopping it first...")
@@ -211,9 +251,15 @@ class Server(object):
 
         # do a last scan before we bring up the ap
         self.logger.debug("Scanning for available networks")
-        try:
-            self.wifi_scan()
-        except:
+        for i in range(2):
+            try:
+                self.wifi_scan()
+            except Exception as e:
+                if isinstance(e, wifi.scheme.InterfaceError):
+                    self.reset_wifi()
+            else:
+                break
+        else:
             # oops, that apparently ran into trouble!
             self.logger.exception("Got an error while trying to scan for available networks before bringing up AP")
 
@@ -221,7 +267,31 @@ class Server(object):
         self.logger.debug("Freeing wifi interface")
         self.free_wifi()
         self.logger.debug("Starting up AP")
-        self.access_point.activate()
+
+        try:
+            self.access_point.activate()
+        except wifi.scheme.WifiError as e:
+            self.logger.exception("Got an error while trying to activate the access point")
+
+            if isinstance(e, wifi.scheme.InterfaceError):
+                # trying to bring up the ap failed with an interface error => might be that the driver hiccuped due to
+                # some earlier event, or that our interface was not ready yet for being turned into an AP, so we now
+                # try to reset it by blocking/unblocking it and then trying to activate the AP a second time
+                
+                try:
+                    self.access_point.deactivate()
+                except:
+                    self.logger.exception("Error while deactivating the failed AP")
+                
+                self.reset_wifi()
+
+                try:
+                    # let's try that again, sometimes second time's the charm
+                    self.logger.info("First try at bringing up the AP failed, we'll try again now for a second time")
+                    self.access_point.activate()
+                except:
+                    self.logger.exception("Second try at activating the access point failed, giving up")
+                    raise
 
         # make sure multicast addresses can be routed on the AP
         self.logger.debug("Adding multicast routes")
@@ -237,6 +307,9 @@ class Server(object):
         return True
 
     def stop_ap(self):
+        if not self.wifi_if_present:
+            return False
+
         # make sure multicast addresses can be routed on the AP
         self.logger.debug("Removing multicast routes")
         try:
@@ -257,6 +330,9 @@ class Server(object):
     def wifi_scan(self):
         if self.access_point.is_running():
             raise RuntimeError("Can't scan for wifi cells when in ap mode")
+
+        if not self.wifi_if_present:
+            raise RuntimeError("No wifi interface present, can't scan")
 
         self.logger.debug("Freeing wifi interface")
         self.free_wifi()
@@ -291,6 +367,10 @@ class Server(object):
             return None
 
     def start_wifi(self, enable_restart=True):
+        if not self.wifi_if_present:
+            self.logger.warn("Wifi interface is not present, can't start it")
+            return False
+
         self.logger.debug("Connecting to wifi %s..." % self.wifi_connection_ssid)
         restart_ap = False
         if self.access_point.is_running() and enable_restart:
@@ -300,20 +380,37 @@ class Server(object):
 
         self.free_wifi()
 
-        from wifi.scheme import ConnectionError
-
         try:
             self.wifi_connection.activate()
             self.logger.info("Connected to wifi %s" % self.wifi_connection_ssid)
             return True
 
-        except ConnectionError:
+        except wifi.scheme.WifiError as e:
+            if isinstance(e, wifi.scheme.InterfaceError):
+                # trying to connect to the network failed with an interface error => might be that the driver hiccuped due to
+                # some earlier event, or that our interface was not ready yet, so we now try to reset it by blocking/unblocking
+                # it and then trying to activate the AP a second time
+                self.logger.info("First try at connecting to the network failed with an interface error, we'll try again now for a second time")
+
+                self.reset_wifi()
+
+                try:
+                    # let's try that again, sometimes second time's the charm
+                    self.wifi_connection.activate()
+                    return True
+                except wifi.scheme.WifiError as e:
+                    self.logger.exception("Second try at connecting to the network failed, giving up")
+
             self.wifi_available = False
             self.logger.warn("Could not connect to wifi %s" % self.wifi_connection_ssid)
             try:
                 self.wifi_connection.deactivate()
             except:
                 self.logger.exception("Could not deactivate wifi connection again, that's odd")
+
+            if isinstance(e, wifi.scheme.InterfaceError):
+                # we encountered an interface error, so we'll try to reset the wifi
+                self.reset_wifi()
 
             if restart_ap:
                 self.start_ap()
@@ -342,6 +439,9 @@ class Server(object):
         return True
 
     def on_start_ap_message(self, message):
+        if not self.wifi_if_present:
+            return False, 'Wifi interface %s is not present' % self.wifi_if
+
         if self.access_point is None:
             return False, 'access point is None'
 
@@ -353,6 +453,9 @@ class Server(object):
         return True, 'started ap'
 
     def on_stop_ap_message(self, message):
+        if not self.wifi_if_present:
+            return False, 'Wifi interface %s is not present' % self.wifi_if
+
         if self.access_point is None:
             return False, 'access point is None'
 
@@ -365,6 +468,9 @@ class Server(object):
         return True, 'stopped ap'
 
     def on_list_wifi_message(self, message):
+        if not self.wifi_if_present:
+            return False, 'Wifi interface %s is not present' % self.wifi_if
+
         self.logger.debug("Listing available wifi cells...")
 
         if self.access_point.is_running():
@@ -383,6 +489,8 @@ class Server(object):
         return True, self.__class__.convert_cells(self.cells)
 
     def on_configure_wifi_message(self, message):
+        if not self.wifi_if_present:
+            return False, 'Wifi interface %s is not present' % self.wifi_if
 
         self.logger.debug("Configuring wifi: %r..." % message)
 
@@ -402,6 +510,9 @@ class Server(object):
         return True, 'configured wifi as "%s"' % self.wifi_name
 
     def on_select_wifi_message(self, message):
+        if not self.wifi_if_present:
+            return False, 'Wifi interface %s is not present' % self.wifi_if
+
         if self.wifi_connection is None:
             return False, 'wifi is not yet configured'
 
@@ -426,7 +537,7 @@ class Server(object):
         current_ssid, current_address = self.current_wifi
 
         wifi = wired = ap = False
-        if self.wifi_if in self.last_reachable_devs and not self.access_point.is_running() and current_ssid:
+        if self.wifi_if_present and self.wifi_if in self.last_reachable_devs and not self.access_point.is_running() and current_ssid:
             wifi = True
         elif self.access_point.is_running():
             ap = True
@@ -444,7 +555,8 @@ class Server(object):
             wifi=dict(
                 current_ssid=current_ssid,
                 current_address=current_address,
-                valid_config=self.wifi_available
+                valid_config=self.wifi_available,
+                present=self.wifi_if_present
             )
         )
 
@@ -482,7 +594,12 @@ class Server(object):
 
     @property
     def current_wifi(self):
-        iwconfig_output = subprocess.check_output(["/sbin/iwconfig", self.wifi_if])
+        try:
+            iwconfig_output = subprocess.check_output(["/sbin/iwconfig", self.wifi_if])
+        except subprocess.CalledProcessError as e:
+            self.logger.warn("Error while trying to retrieve status of {wifi_if}: {output}".format(wifi_if=self.wifi_if, output=e.output))
+            self.wifi_if_present = False
+            return None, None
 
         m = iwconfig_re.search(iwconfig_output)
         if not m:
@@ -511,6 +628,7 @@ def start_server(config):
         ap_domain=config["ap"]["domain"],
         wifi_name=config["wifi"]["name"],
         wifi_free=config["wifi"]["free"],
+        wifi_kill=config["wifi"]["kill"],
         path_hostapd=config["paths"]["hostapd"],
         path_hostapd_conf=config["paths"]["hostapd_conf"],
         path_dnsmasq=config["paths"]["dnsmasq"],
@@ -566,7 +684,7 @@ def server():
     parser.add_argument("--ap-driver", help="The driver to use for the hostapd, defaults to nl80211")
     parser.add_argument("--ap-ssid", help="SSID of the AP wifi")
     parser.add_argument("--ap-psk", help="Passphrase with which to secure the AP wifi, defaults to creation of an unsecured wifi")
-    parser.add_argument("--ap-channel", type=int, default=3, help="Channel on which to setup AP, defaults to 3")
+    parser.add_argument("--ap-channel", type=int, help="Channel on which to setup AP, defaults to 3")
     parser.add_argument("--ap-ip", type=valid_ip, help="IP of AP host in newly created network, defaults to '10.250.250.1'")
     parser.add_argument("--ap-network", type=valid_network, help="Network address (CIDR4) of network to create on AP, defaults to '10.250.250.0/24'")
     parser.add_argument("--ap-range", type=dhcp_range, help="Range of IPs to handout via DHPC on AP, comma-separated, defaults to '10.250.250.100,10.250.250.200'")
@@ -574,6 +692,7 @@ def server():
     parser.add_argument("--ap-forwarding", action="store_true", help="Enable forwarding from AP to wired connection, disabled by default")
     parser.add_argument("--wifi-name", help="Internal name to assign to Wifi config, defaults to 'netconnectd_wifi', you mostly won't have to set this")
     parser.add_argument("--wifi-free", action="store_true", help="Whether the wifi has to be freed from network manager before every configuration attempt, defaults to false")
+    parser.add_argument("--wifi-kill", action="store_true", help="Whether the wifi interface has to be killed before every configuration attmept, defaults to false")
     parser.add_argument("--path-hostapd", help="Path to hostapd executable, defaults to /usr/sbin/hostapd")
     parser.add_argument("--path-hostapd-conf", help="Path to hostapd configuration folder, defaults to /etc/hostapd/conf.d")
     parser.add_argument("--path-dnsmasq", help="Path to dnsmasq executable, defaults to /usr/sbin/dnsmasq")
@@ -676,6 +795,8 @@ def server():
         config["wifi"]["name"] = args.wifi_name
     if args.wifi_free:
         config["wifi"]["free"] = True
+    if args.wifi_kill:
+        config["wifi"]["kill"] = True
 
     if args.path_hostapd:
         config["paths"]["hostapd"] = args.path_hostapd
